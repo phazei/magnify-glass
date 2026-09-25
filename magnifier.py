@@ -14,11 +14,13 @@ Requirements:
     pip install pygame mss numpy
 """
 
+import json
 import math
+import os
+import time
 import pygame
 import numpy as np
 import mss
-import sys
 
 # ── Platform-specific imports (consolidated) ──────────────────────────────────
 
@@ -30,6 +32,22 @@ try:
 except ImportError:
     pass
 
+if _HAS_WIN32:
+    # Declare per-monitor DPI awareness before pygame creates the window.
+    # Otherwise the window starts DPI-unaware and mss later flips the
+    # process to aware, so window positions, cursor coordinates and the
+    # capture region disagree on scaled displays (125%, 150%, ...).
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 TITLE        = "Optical Magnifier"
@@ -37,6 +55,14 @@ DEFAULT_SIZE = 480
 MIN_SIZE     = 120
 MAX_SIZE     = 800
 FPS          = 30
+
+VK_F8        = 0x77         # follow-cursor toggle
+VK_F9        = 0x78         # screenshot (freeze) toggle
+DOUBLE_CLICK_MS = 350
+SAVE_DELAY_S = 1.0          # save settings this long after they stop changing
+SETTINGS_PATH = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"),
+    "magnify-glass", "settings.json")
 
 # Default optical parameters.  UI exposes C = 1/R (curvature).
 DEFAULT_N    = 1.5
@@ -110,6 +136,7 @@ ICON_RADIUS_FRAC = 0.88    # fraction of lens radius for icon center
 ICON_SIZE        = 48       # diameter of icon circle
 ICON_HIT_SIZE    = 56       # hit-test diameter
 RADIAL_FADE_S    = 0.15     # seconds for radial icon fade
+RIM_BAND_FRAC    = 0.80     # icons appear when cursor is beyond this radius
 
 # Angles (radians) for 7 param icons across the upper semicircle (9 o'clock to 3 o'clock)
 # Evenly spaced: 180, 155, 130, 105, 80, 55, 30 degrees (left to right)
@@ -321,127 +348,122 @@ def build_distortion_map(size: int, n: float, C: float, d: float, H: float, Z: f
     return src_x, src_y, M, f, oversample
 
 
-def apply_lens(crop: np.ndarray, src_x: np.ndarray, src_y: np.ndarray) -> np.ndarray:
-    H, W = crop.shape[:2]
+# ── Per-frame image pipeline ─────────────────────────────────────────────────
+#
+# Everything that depends only on the lens parameters (sample positions,
+# interpolation weights, chromatic-aberration offsets, edge-blur masks) is
+# precomputed once when a parameter changes.  Per frame we only gather pixels
+# from the captured BGRA buffer and blend them.
+
+def _bilinear_taps(src_x: np.ndarray, src_y: np.ndarray, W: int, H: int):
+    """Flat corner indices (4, N) and weights (4, N) for bilinear sampling
+    of a W x H image at the (flattened) positions src_x/src_y."""
     x0 = np.clip(src_x.astype(np.int32), 0, W - 2)
     y0 = np.clip(src_y.astype(np.int32), 0, H - 2)
-    x1 = x0 + 1
-    y1 = y0 + 1
-    fx = (src_x - x0).astype(np.float32)[..., np.newaxis]
-    fy = (src_y - y0).astype(np.float32)[..., np.newaxis]
-    c00 = crop[y0, x0].astype(np.float32)
-    c10 = crop[y0, x1].astype(np.float32)
-    c01 = crop[y1, x0].astype(np.float32)
-    c11 = crop[y1, x1].astype(np.float32)
-    out = (c00 * (1 - fx) * (1 - fy) +
-           c10 * fx       * (1 - fy) +
-           c01 * (1 - fx) * fy       +
-           c11 * fx       * fy)
-    return np.clip(out, 0, 255).astype(np.uint8)
+    fx = np.clip(src_x - x0, 0.0, 1.0).astype(np.float32)
+    fy = np.clip(src_y - y0, 0.0, 1.0).astype(np.float32)
+    i00 = y0.astype(np.intp) * W + x0
+    idx = np.stack([i00, i00 + 1, i00 + W, i00 + W + 1])
+    w = np.stack([(1 - fx) * (1 - fy), fx * (1 - fy),
+                  (1 - fx) * fy,       fx * fy]).astype(np.float32)
+    return idx, w
 
 
-def apply_chromatic_aberration(img: np.ndarray, ca_strength: float) -> np.ndarray:
-    """Shift R and B channels radially outward/inward from center.
-    Fades effect near the rim to avoid boundary clamp artifacts."""
-    if ca_strength < 0.005:
-        return img
-    h, w = img.shape[:2]
-    half_y, half_x = h / 2.0, w / 2.0
-    yy, xx = np.mgrid[0:h, 0:w]
-    dx = (xx - half_x) / half_x
-    dy = (yy - half_y) / half_y
+def _interp2d(m: np.ndarray, sx: np.ndarray, sy: np.ndarray) -> np.ndarray:
+    """Bilinearly sample a 2D float map at (sx, sy)."""
+    h, w = m.shape
+    x0 = np.clip(sx.astype(np.int32), 0, w - 2)
+    y0 = np.clip(sy.astype(np.int32), 0, h - 2)
+    fx = np.clip(sx - x0, 0.0, 1.0)
+    fy = np.clip(sy - y0, 0.0, 1.0)
+    return (m[y0, x0]         * (1 - fx) * (1 - fy) +
+            m[y0, x0 + 1]     * fx       * (1 - fy) +
+            m[y0 + 1, x0]     * (1 - fx) * fy       +
+            m[y0 + 1, x0 + 1] * fx       * fy).astype(np.float32)
+
+
+def chromatic_maps(src_x: np.ndarray, src_y: np.ndarray, ca_strength: float):
+    """Compose chromatic aberration into the distortion map.
+
+    Returns [(rx, ry), (bx, by)]: source maps for the red and blue channels.
+    Red is pushed radially outward, blue inward; the effect fades out near
+    the rim to avoid boundary artifacts.  Because the shift is folded into
+    the map, CA costs nothing per frame."""
+    s = src_x.shape[0]
+    half = s / 2.0
+    yy, xx = np.mgrid[0:s, 0:s].astype(np.float32)
+    dx = (xx - half) / half
+    dy = (yy - half) / half
     r2 = dx * dx + dy * dy
+    fade = np.clip((0.98 - np.sqrt(r2)) / 0.13, 0, 1)
+    shift = ca_strength * r2 * 0.3 * fade
+    maps = []
+    for factor in (1.0 + shift, 1.0 - shift * 0.6):
+        sx = dx * factor * half + half
+        sy = dy * factor * half + half
+        maps.append((_interp2d(src_x, sx, sy), _interp2d(src_y, sx, sy)))
+    return maps
 
-    r = np.sqrt(r2)
-    ca_fade = np.clip((0.98 - r) / 0.13, 0, 1).astype(np.float32)
 
-    shift = ca_strength * r2 * 0.3 * ca_fade
+def edge_blur_plan(size: int, eb_strength: float):
+    """Precompute which pixels get blurred and by how much.
 
-    r_sx = dx * (1.0 + shift) * half_x + half_x
-    r_sy = dy * (1.0 + shift) * half_y + half_y
-    b_sx = dx * (1.0 - shift * 0.6) * half_x + half_x
-    b_sy = dy * (1.0 - shift * 0.6) * half_y + half_y
+    Returns (flat_idx, weights(N,1), radius, small_idx) or None."""
+    if eb_strength < 0.01:
+        return None
+    half = size / 2.0
+    yy, xx = np.mgrid[0:size, 0:size]
+    r = np.sqrt(((xx - half) / half) ** 2 + ((yy - half) / half) ** 2)
+    onset = max(0.05, 1.0 - eb_strength)
+    blend = np.clip((r - onset) / max(0.01, 1.0 - onset), 0, 1).ravel()
+    idx = np.flatnonzero(blend > 0.002)
+    w = blend[idx].astype(np.float32)[:, None]
+    radius = max(2, int(eb_strength * 16))
+    ys, xs = np.divmod(idx, size)
+    small_w = (size + 1) // 2
+    small_idx = (ys // 2) * small_w + (xs // 2)
+    return idx, w, radius, small_idx
 
-    out = img.copy()
 
-    r_x0 = np.clip(r_sx.astype(np.int32), 0, w - 2)
-    r_y0 = np.clip(r_sy.astype(np.int32), 0, h - 2)
-    r_x1 = r_x0 + 1
-    r_y1 = r_y0 + 1
-    r_fx = np.clip(r_sx - r_x0, 0, 1).astype(np.float32)
-    r_fy = np.clip(r_sy - r_y0, 0, 1).astype(np.float32)
-    out[:, :, 0] = np.clip(
-        img[r_y0, r_x0, 0] * (1 - r_fx) * (1 - r_fy) +
-        img[r_y0, r_x1, 0] * r_fx * (1 - r_fy) +
-        img[r_y1, r_x0, 0] * (1 - r_fx) * r_fy +
-        img[r_y1, r_x1, 0] * r_fx * r_fy,
-        0, 255).astype(np.uint8)
+def _box_blur(img: np.ndarray, r: int) -> np.ndarray:
+    """Separable box blur on an (H, W, 3) float32 array via cumulative sums."""
+    k = 2 * r + 1
+    p = np.pad(img, ((0, 0), (r + 1, r), (0, 0)), mode='edge')
+    cs = np.cumsum(p, axis=1, dtype=np.float32)
+    img = (cs[:, k:] - cs[:, :-k]) / k
+    p = np.pad(img, ((r + 1, r), (0, 0), (0, 0)), mode='edge')
+    cs = np.cumsum(p, axis=0, dtype=np.float32)
+    return (cs[k:] - cs[:-k]) / k
 
-    b_x0 = np.clip(b_sx.astype(np.int32), 0, w - 2)
-    b_y0 = np.clip(b_sy.astype(np.int32), 0, h - 2)
-    b_x1 = b_x0 + 1
-    b_y1 = b_y0 + 1
-    b_fx = np.clip(b_sx - b_x0, 0, 1).astype(np.float32)
-    b_fy = np.clip(b_sy - b_y0, 0, 1).astype(np.float32)
-    out[:, :, 2] = np.clip(
-        img[b_y0, b_x0, 2] * (1 - b_fx) * (1 - b_fy) +
-        img[b_y0, b_x1, 2] * b_fx * (1 - b_fy) +
-        img[b_y1, b_x0, 2] * (1 - b_fx) * b_fy +
-        img[b_y1, b_x1, 2] * b_fx * b_fy,
-        0, 255).astype(np.uint8)
+
+def apply_edge_blur(img: np.ndarray, plan) -> None:
+    """Blur toward the rim, in place.  The blur is computed at half
+    resolution (the blurred region is soft anyway) and only blended into
+    the pixels that need it."""
+    idx, w, radius, small_idx = plan
+    small = img[::2, ::2].astype(np.float32)
+    r = max(1, radius // 2)
+    small = _box_blur(_box_blur(small, r), r)
+    blurred = small.reshape(-1, 3)[small_idx]
+    flat = img.reshape(-1, 3)
+    flat[idx] = (flat[idx] * (1.0 - w) + blurred * w + 0.5).astype(np.uint8)
+
+
+def sample_rgb(flat_bgra: np.ndarray, idx: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Bilinear gather of all three channels -> (N, 3) float32 RGB."""
+    out = flat_bgra[idx[0], 2::-1] * w[0][:, None]
+    for k in (1, 2, 3):
+        out += flat_bgra[idx[k], 2::-1] * w[k][:, None]
     return out
 
 
-def _box_blur_channel(ch: np.ndarray, radius: int) -> np.ndarray:
-    """Fast box blur on a 2D float32 array using cumulative sums."""
-    if radius < 1:
-        return ch
-    h, w = ch.shape
-    k = 2 * radius + 1
-    # Horizontal pass
-    padded = np.pad(ch, ((0, 0), (radius, radius)), mode='edge')
-    cs = np.cumsum(padded, axis=1)
-    horiz = (cs[:, k:] - cs[:, :-k]) / k
-    # Crop to original width (cumsum output may be wider)
-    horiz = horiz[:, :w] if horiz.shape[1] >= w else np.pad(horiz, ((0, 0), (0, w - horiz.shape[1])), mode='edge')
-    # Vertical pass
-    padded = np.pad(horiz, ((radius, radius), (0, 0)), mode='edge')
-    cs = np.cumsum(padded, axis=0)
-    vert = (cs[k:] - cs[:-k]) / k
-    vert = vert[:h, :] if vert.shape[0] >= h else np.pad(vert, ((0, h - vert.shape[0]), (0, 0)), mode='edge')
-    return vert
-
-
-def apply_edge_blur(img: np.ndarray, eb_strength: float) -> np.ndarray:
-    """Blur the image progressively toward the circular edge."""
-    if eb_strength < 0.01:
-        return img
-    h, w = img.shape[:2]
-    half_y, half_x = h / 2.0, w / 2.0
-    yy, xx = np.mgrid[0:h, 0:w]
-    r = np.sqrt(((xx - half_x) / half_x) ** 2 + ((yy - half_y) / half_y) ** 2)
-
-    # Blend mask: 0 (sharp) at center, 1 (fully blurred) at rim
-    onset = max(0.05, 1.0 - eb_strength)
-    blend = np.clip((r - onset) / max(0.01, 1.0 - onset), 0, 1).astype(np.float32)
-
-    # Blur radius scales with strength — bigger strength = wider blur kernel
-    blur_radius = max(2, int(eb_strength * 16))
-
-    img_f = img.astype(np.float32)
-
-    # Blur each channel independently with two-pass box blur (2 iterations for smoother result)
-    blurred = np.empty_like(img_f)
-    for c in range(3):
-        ch = img_f[:, :, c]
-        for _ in range(2):
-            ch = _box_blur_channel(ch, blur_radius)
-        blurred[:, :, c] = ch
-
-    # Blend: sharp in center, blurred at edges
-    blend_3 = blend[..., np.newaxis]
-    out = img_f * (1.0 - blend_3) + blurred * blend_3
-    return np.clip(out, 0, 255).astype(np.uint8)
+def sample_channel(flat_bgra: np.ndarray, ch: int, idx: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Bilinear gather of one BGRA channel -> (N,) float32."""
+    col = flat_bgra[:, ch]
+    out = col[idx[0]] * w[0]
+    for k in (1, 2, 3):
+        out += col[idx[k]] * w[k]
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -480,7 +502,14 @@ class LensMagnifier:
 
         self.always_on_top     = True
         self.screenshot_mode   = False   # F9: freeze frame + allow capture
-        self._f9_was_down      = False
+        self.follow_mode       = False   # F8: lens follows the cursor
+        self._keys_down        = {}
+        self._last_click       = (None, 0)
+        self._mag_rect         = pygame.Rect(0, 0, 0, 0)
+        self._base_preset      = 'Reading'
+        self._saved_state      = None
+        self._pending_state    = None
+        self._pending_since    = 0.0
 
         self.dragging          = False
         self.drag_offset       = (0, 0)
@@ -503,6 +532,8 @@ class LensMagnifier:
         self._handle_rect       = pygame.Rect(0, 0, 0, 0)
 
         self._apply_preset('Reading')
+        self._load_settings()
+        self.resize_size0 = self._pending_size = self.size
 
         self._win_flags = pygame.NOFRAME
         max_dim = self._max_surface_dim()
@@ -514,19 +545,23 @@ class LensMagnifier:
         self._apply_window_region()
 
         self.clock   = pygame.time.Clock()
-        self.sct     = mss.mss()
+        self.sct     = mss.MSS()
         self.font_sm = pygame.font.SysFont("Consolas", FONT_SIZE_SM)
         self.font_md = pygame.font.SysFont("Consolas", FONT_SIZE_MD, bold=True)
         self.font_icon = pygame.font.SysFont("Consolas", FONT_SIZE_ICON, bold=True)
         self.font_icon_val = pygame.font.SysFont("Consolas", FONT_SIZE_ICON_VAL, bold=True)
 
-        self._map_buf_x = np.empty((self.size, self.size), dtype=np.float32)
-        self._map_buf_y = np.empty((self.size, self.size), dtype=np.float32)
-
         self._map_key    = None
-        self._src_x      = self._src_y = None
+        self._eb_key     = None
+        self._eb_plan    = None
         self._M          = self._f = None
         self._oversample = 1.0
+        self._cap_size   = self.size
+        self._inside     = None     # flat indices of pixels inside the circle
+        self._taps       = None     # [(idx, w)] x1 (RGB) or x3 (R, G, B)
+        self._clip_size  = 0
+        self._clip_mask  = None
+        self._clip_surf  = None
         self._rebuild_map()
 
         self._running = True
@@ -538,6 +573,7 @@ class LensMagnifier:
         self.n, self.C, self.d, self.H, self.Z = p['n'], p['C'], p['d'], p['H'], p['Z']
         self.CA, self.EB = p['CA'], p['EB']
         self.active_preset = name
+        self._base_preset = name      # what "reset" goes back to
 
     def _check_preset_match(self):
         for name, p in PRESETS.items():
@@ -771,31 +807,93 @@ class LensMagnifier:
     # ── distortion map ────────────────────────────────────────────────────────
 
     def _rebuild_map(self):
-        key = (self.size, round(self.n, 4), round(self.C, 4),
-               round(self.d, 4), round(self.H, 4), round(self.Z, 4))
+        """Recompute everything that depends on the lens parameters.
+        Cheap no-op when nothing relevant changed."""
+        s = self.size
+        eb_key = (s, round(self.EB, 4))
+        if eb_key != self._eb_key:
+            self._eb_key = eb_key
+            # 0.4 scale is intentional: full-strength blur looked bad
+            self._eb_plan = edge_blur_plan(s, self.EB * 0.4)
+
+        key = (s, round(self.n, 4), round(self.C, 4), round(self.d, 4),
+               round(self.H, 4), round(self.Z, 4), round(self.CA, 4))
         if key == self._map_key:
             return
         self._map_key = key
-        if self._map_buf_x.shape[0] != self.size:
-            self._map_buf_x = np.empty((self.size, self.size), dtype=np.float32)
-            self._map_buf_y = np.empty((self.size, self.size), dtype=np.float32)
-        self._src_x, self._src_y, self._M, self._f, self._oversample = \
-            build_distortion_map(self.size, self.n, self.C, self.d, self.H, self.Z)
 
-    # ── screen capture ────────────────────────────────────────────────────────
+        src_x, src_y, self._M, self._f, self._oversample = \
+            build_distortion_map(s, self.n, self.C, self.d, self.H, self.Z)
 
-    def _capture_region(self, cx, cy):
+        cap = max(s, int(s * self._oversample + 0.5))
+        cap += cap % 2
+        self._cap_size = cap
+
+        half = s / 2.0
+        lin = (np.arange(s) - half + 0.5) / half
+        px, py = np.meshgrid(lin, lin)
+        self._inside = np.flatnonzero((px ** 2 + py ** 2).ravel() <= 1.0)
+        ins = self._inside
+
+        if self.CA > 0.005:
+            (rx, ry), (bx, by) = chromatic_maps(src_x, src_y, self.CA)
+            self._taps = [
+                _bilinear_taps(rx.ravel()[ins], ry.ravel()[ins], cap, cap),
+                _bilinear_taps(src_x.ravel()[ins], src_y.ravel()[ins], cap, cap),
+                _bilinear_taps(bx.ravel()[ins], by.ravel()[ins], cap, cap),
+            ]
+        else:
+            self._taps = [
+                _bilinear_taps(src_x.ravel()[ins], src_y.ravel()[ins], cap, cap)]
+
+    # ── screen capture + lens image ───────────────────────────────────────────
+
+    def _lens_image(self, cx, cy):
+        """Capture around (cx, cy) and return the refracted (s, s, 3) RGB
+        image, or None if the capture came back with an unexpected size."""
         s = self.size
-        capture_size = max(s, int(s * self._oversample + 0.5))
-        capture_size += capture_size % 2
-        half = capture_size // 2
+        cap = self._cap_size
+        half = cap // 2
         raw = self.sct.grab({
             "top": cy - half, "left": cx - half,
-            "width": capture_size, "height": capture_size,
+            "width": cap, "height": cap,
         })
-        img = np.frombuffer(raw.raw, dtype=np.uint8).reshape(
-            raw.height, raw.width, 4)
-        return img[:, :, 2::-1]
+        if raw.width != cap or raw.height != cap:
+            return None
+        flat = np.frombuffer(raw.raw, dtype=np.uint8).reshape(-1, 4)
+
+        # Outside the circle is clipped away, but edge blur can pull those
+        # pixels in, so fill them with the centre colour rather than black.
+        centre = flat[(cap // 2) * cap + cap // 2, 2::-1]
+        out = np.empty((s * s, 3), dtype=np.uint8)
+        out[:] = centre
+
+        if len(self._taps) == 1:
+            vals = sample_rgb(flat, *self._taps[0])
+        else:
+            vals = np.empty((len(self._inside), 3), dtype=np.float32)
+            for c, bgra_ch in enumerate((2, 1, 0)):   # R, G, B
+                vals[:, c] = sample_channel(flat, bgra_ch, *self._taps[c])
+        vals += 0.5
+        out[self._inside] = vals.astype(np.uint8)
+
+        img = out.reshape(s, s, 3)
+        if self._eb_plan is not None:
+            apply_edge_blur(img, self._eb_plan)
+        return img
+
+    def _clip_to_circle(self, pg_img):
+        s = self.size
+        if self._clip_size != s:
+            self._clip_size = s
+            self._clip_mask = pygame.Surface((s, s), pygame.SRCALPHA)
+            pygame.draw.circle(self._clip_mask, (255, 255, 255, 255),
+                               (s // 2, s // 2), s // 2)
+            self._clip_surf = pygame.Surface((s, s), pygame.SRCALPHA)
+        self._clip_surf.blit(pg_img, (0, 0))
+        self._clip_surf.blit(self._clip_mask, (0, 0),
+                             special_flags=pygame.BLEND_RGBA_MIN)
+        return self._clip_surf
 
     # ── render ────────────────────────────────────────────────────────────────
 
@@ -813,24 +911,11 @@ class LensMagnifier:
         screen_cx = wx + s // 2
         screen_cy = wy + s // 2
 
-        crop = self._capture_region(screen_cx, screen_cy)
-        distorted = apply_lens(crop, self._src_x, self._src_y)
-
-        # Post-processing: chromatic aberration and edge blur
-        if self.CA > 0.005:
-            distorted = apply_chromatic_aberration(distorted, self.CA)
-        if self.EB > 0.01:
-            distorted = apply_edge_blur(distorted, self.EB * 0.4)
-
-        pg_img = pygame.surfarray.make_surface(
-            np.transpose(distorted, (1, 0, 2)))
-
-        # Circular clip
-        mask = pygame.Surface((s, s), pygame.SRCALPHA)
-        pygame.draw.circle(mask, (255, 255, 255, 255), (s // 2, s // 2), s // 2)
-        clipped = pygame.Surface((s, s), pygame.SRCALPHA)
-        clipped.blit(pg_img, (0, 0))
-        clipped.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+        distorted = self._lens_image(screen_cx, screen_cy)
+        if distorted is None:
+            return
+        pg_img = pygame.image.frombuffer(distorted, (s, s), "RGB")
+        clipped = self._clip_to_circle(pg_img)
 
         self.screen.fill((0, 0, 0, 0))
 
@@ -853,14 +938,18 @@ class LensMagnifier:
         # Magnification readout
         self._draw_rim_mag()
 
+        # UI is hidden while following the cursor (it would sit under the
+        # pointer permanently and can't be clicked anyway).
+        show_ui = not self._resize_expanded and not self.follow_mode
+
         # Radial icons (inside lens, not in expanded mode)
-        if not self._resize_expanded:
+        if show_ui:
             self._update_radial_hover(mx, my)
             if self.radial_alpha > 0.02:
                 self._draw_radial_icons()
 
         # Bottom HUD panel (not in expanded mode)
-        if not self._resize_expanded:
+        if show_ui:
             self._update_panel_hover(mx, my)
             if self.panel_alpha > 0.02:
                 self._draw_panel()
@@ -904,7 +993,7 @@ class LensMagnifier:
     def _draw_rim_mag(self):
         s = self.size
         off = self._resize_expand_off if self._resize_expanded else 0
-        m = self._M
+        m = self._M * self.Z          # optical magnification x digital zoom
         sign = "" if m >= 0 else "-"
         label = f"{sign}{abs(m):.1f}x"
         surf = self.font_md.render(label, True, C_MAG_TEXT[:3])
@@ -915,6 +1004,7 @@ class LensMagnifier:
         pygame.draw.rect(ps, (0, 0, 0, 120), ps.get_rect(), border_radius=6)
         self.screen.blit(ps, pill.topleft)
         self.screen.blit(surf, rect)
+        self._mag_rect = pill.move(-off, -off)   # window-local, for dbl-click
 
     # ── radial icon hover / fade ──────────────────────────────────────────────
 
@@ -925,7 +1015,9 @@ class LensMagnifier:
 
         half = s / 2.0
         dist = math.sqrt((mx - half) ** 2 + (my - half) ** 2)
-        near_rim = (half * 0.45) <= dist <= (half + 20)
+        # Only a thin band at the rim reveals the icons, so they don't cover
+        # what you're magnifying.  Hovering an icon itself also keeps them up.
+        near_rim = (half * RIM_BAND_FRAC) <= dist <= (half + 20)
 
         hovering_icon = self._icon_hit_test(mx, my) is not None
         should_show = near_rim or hovering_icon or self._icon_dragging is not None
@@ -1207,13 +1299,20 @@ class LensMagnifier:
             if event.key == pygame.K_ESCAPE:
                 self._running = False
             elif event.key == pygame.K_F9 and not _HAS_WIN32:
-                # On Windows F9 is polled globally in _poll_hotkeys()
+                # On Windows F8/F9 are polled globally in _poll_hotkeys()
                 self._toggle_screenshot_mode()
+            elif event.key == pygame.K_r:
+                self._reset_all()
             elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3,
                                pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7):
                 idx = event.key - pygame.K_1
                 if idx < len(self.params_order):
                     self.selected_param = self.params_order[idx]
+
+        elif self.follow_mode and event.type in (
+                pygame.MOUSEWHEEL, pygame.MOUSEBUTTONDOWN,
+                pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+            return   # window is click-through while following
 
         elif event.type == pygame.MOUSEWHEEL:
             d = 1 if event.y > 0 else -1
@@ -1263,6 +1362,10 @@ class LensMagnifier:
             # Radial icon click — select or start drag
             icon_key = self._icon_hit_test(mx, my)
             if icon_key and self.radial_alpha > 0.3:
+                self.selected_param = icon_key
+                if self._is_double_click(icon_key):
+                    self._reset_param(icon_key)
+                    return
                 self._icon_dragging = icon_key
                 abs_pos = self._get_abs_mouse()
                 self._icon_drag_start_x = abs_pos[0]
@@ -1270,6 +1373,14 @@ class LensMagnifier:
                 self._icon_drag_start_val = getattr(self, icon_key)
                 self.selected_param = icon_key
                 return
+
+            # Double-click the magnification readout: reset everything
+            if self._mag_rect.collidepoint(mx, my):
+                if self._is_double_click('mag'):
+                    self._reset_all()
+                    return
+            else:
+                self._last_click = (None, 0)
 
             # Drag the whole lens
             self.dragging = True
@@ -1349,14 +1460,171 @@ class LensMagnifier:
             self.dragging = True
             self.drag_offset = (wx - pt.x, wy - pt.y)
 
+    def _cursor_over_lens(self):
+        ax, ay = self._get_abs_mouse()
+        wx, wy = self.win_pos
+        half = self.size / 2.0
+        return (ax - wx - half) ** 2 + (ay - wy - half) ** 2 <= half ** 2
+
     def _poll_hotkeys(self):
-        """Global F9 toggle (works even when the lens isn't focused)."""
+        """Global F8 / F9 toggles.  They work without focus, but only while
+        the cursor is over the lens so the same key in other apps (e.g.
+        'toggle breakpoint') doesn't trigger them."""
         if not _HAS_WIN32:
             return
-        down = bool(ctypes.windll.user32.GetAsyncKeyState(0x78) & 0x8000)  # VK_F9
-        if down and not self._f9_was_down:
-            self._toggle_screenshot_mode()
-        self._f9_was_down = down
+        user32 = ctypes.windll.user32
+        over = None
+        for vk, action in ((VK_F8, self._toggle_follow_mode),
+                           (VK_F9, self._toggle_screenshot_mode)):
+            down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+            if down and not self._keys_down.get(vk):
+                if over is None:
+                    over = self._cursor_over_lens()
+                if over:
+                    action()
+            self._keys_down[vk] = down
+
+    # ── follow-cursor mode ────────────────────────────────────────────────────
+
+    def _set_click_through(self, on):
+        """Let mouse input pass through the window to whatever is below."""
+        user32, hwnd = self._get_hwnd()
+        if not hwnd:
+            return
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        LWA_ALPHA = 0x2
+        try:
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if on:
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                      style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+                user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+            else:
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                      style & ~(WS_EX_LAYERED | WS_EX_TRANSPARENT))
+        except Exception:
+            pass
+
+    def _toggle_follow_mode(self):
+        if not _HAS_WIN32:
+            return
+        self.follow_mode = not self.follow_mode
+        # Drop any in-progress interaction so nothing is left "held".
+        self.dragging = False
+        self.resizing = False
+        self._icon_dragging = None
+        self.dropdown_open = False
+        self._leave_resize_expand()
+        self.panel_alpha = 0.0
+        self.radial_alpha = 0.0
+        self._set_click_through(self.follow_mode)
+        self._set_always_on_top(self.always_on_top or self.follow_mode)
+        self._exclude_from_capture()
+        self._apply_window_region()
+
+    def _update_follow(self):
+        ax, ay = self._get_abs_mouse()
+        half = self.size // 2
+        pos = (ax - half, ay - half)
+        if pos != self.win_pos:
+            self._move_window(*pos)
+
+    # ── reset ─────────────────────────────────────────────────────────────────
+
+    def _reset_param(self, key):
+        """Reset one parameter to the value of the last chosen preset."""
+        setattr(self, key, PRESETS[self._base_preset][key])
+        self._check_preset_match()
+        self._rebuild_map()
+
+    def _reset_all(self):
+        self._apply_preset(self._base_preset)
+        self._rebuild_map()
+
+    def _is_double_click(self, target):
+        now = pygame.time.get_ticks()
+        last_target, last_t = self._last_click
+        if target == last_target and now - last_t <= DOUBLE_CLICK_MS:
+            self._last_click = (None, 0)
+            return True
+        self._last_click = (target, now)
+        return False
+
+    # ── settings persistence ──────────────────────────────────────────────────
+
+    def _settings_state(self):
+        return {
+            "x": int(self.win_pos[0]), "y": int(self.win_pos[1]),
+            "size": int(self.size),
+            "params": {k: getattr(self, k) for k in self.params_order},
+            "base_preset": self._base_preset,
+            "always_on_top": self.always_on_top,
+        }
+
+    def _load_settings(self):
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        try:
+            params = data.get("params", {})
+            for k in self.params_order:
+                if k in params:
+                    setattr(self, k, self._clamp_param(k, float(params[k])))
+            if data.get("base_preset") in PRESETS:
+                self._base_preset = data["base_preset"]
+            if "size" in data:
+                self.size = max(MIN_SIZE, min(MAX_SIZE, int(data["size"])))
+            if "always_on_top" in data:
+                self.always_on_top = bool(data["always_on_top"])
+            if "x" in data and "y" in data:
+                self.win_pos = self._clamp_to_screen(int(data["x"]), int(data["y"]))
+        except (TypeError, ValueError):
+            pass
+        self._check_preset_match()
+
+    def _clamp_to_screen(self, x, y):
+        """Keep a good chunk of the lens on the virtual desktop, so a saved
+        position from a now-disconnected monitor can't strand it."""
+        if not _HAS_WIN32:
+            return x, y
+        gsm = ctypes.windll.user32.GetSystemMetrics
+        vx, vy, vw, vh = gsm(76), gsm(77), gsm(78), gsm(79)
+        if vw <= 0 or vh <= 0:
+            return x, y
+        s, keep = self.size, min(self.size, 100)
+        x = max(vx - s + keep, min(x, vx + vw - keep))
+        y = max(vy - s + keep, min(y, vy + vh - keep))
+        return x, y
+
+    def _save_settings(self, state=None):
+        state = state or self._settings_state()
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+            tmp = SETTINGS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp, SETTINGS_PATH)
+            self._saved_state = state
+        except OSError:
+            pass
+
+    def _maybe_save(self):
+        """Save shortly after the state stops changing.  Saving as we go
+        (rather than only on exit) means closing the terminal doesn't lose
+        your settings."""
+        if self.dragging or self.resizing or self._icon_dragging:
+            return
+        state = self._settings_state()
+        now = time.monotonic()
+        if state != self._pending_state:
+            self._pending_state = state
+            self._pending_since = now
+        elif state != self._saved_state and now - self._pending_since >= SAVE_DELAY_S:
+            self._save_settings(state)
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -1375,25 +1643,34 @@ class LensMagnifier:
 
         try:
             while self._running:
-                self._check_focus()
+                if not self.follow_mode:
+                    self._check_focus()
                 self._poll_hotkeys()
                 for event in pygame.event.get():
                     self.handle_event(event)
-                self._update_drag()
                 # In screenshot mode the window is visible to capture, so
                 # grabbing the screen would feed the lens back into itself.
-                # Keep showing the last rendered frame instead.
+                # Keep showing the last rendered frame (and position) instead.
                 if not self.screenshot_mode:
+                    if self.follow_mode:
+                        self._update_follow()
+                    else:
+                        self._update_drag()
                     self.render()
+                self._maybe_save()
                 self.clock.tick(FPS)
         finally:
-            # Always clean up the window region on exit, even on crash/Ctrl+C
+            # Always clean up on exit, even on crash/Ctrl+C.  (No sys.exit()
+            # here: that would swallow the traceback of a crash.)
+            try:
+                self._save_settings()
+            except Exception:
+                pass
             user32, hwnd = self._get_hwnd()
             if hwnd:
                 ctypes.windll.user32.SetWindowRgn(hwnd, 0, True)
             self.sct.close()
             pygame.quit()
-            sys.exit()
 
 
 if __name__ == "__main__":
